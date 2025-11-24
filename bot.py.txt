@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+Bot Telegram semplificato per brandizzare immagini
+Riceve un brand personalizzato, poi sovrappone le immagini inviate su quel brand
+"""
+import os
+import logging
+import httpx
+import asyncio
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from PIL import Image
+from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes
+from telegram import Update
+
+# Thread pool per operazioni sincrone (PIL, I/O)
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
+# File di log dedicato per thread pool (per debug)
+thread_log_file = open("/tmp/telegram_bot_threads.log", "a", buffering=1)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def thread_log(msg):
+    """Log in thread pool che flush subito"""
+    import time
+    thread_log_file.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    thread_log_file.flush()
+
+# Salva il brand per ogni utente {user_id: Image}
+user_brands = {}
+
+BACKGROUND_PATH = "telegram_bot/assets/background.png"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start"""
+    await update.message.reply_text(
+        "👋 Ciao! Sono un bot che brandizza le tue immagini.\n\n"
+        "🎨 <b>Come usarmi:</b>\n"
+        "1️⃣ Invia il tuo <b>brand/sfondo</b> con il comando /brand\n"
+        "2️⃣ Invia le <b>immagini</b> che vuoi incollarci sopra\n"
+        "3️⃣ Ricevi le immagini brandizzate! ✨\n\n"
+        "Oppure invia solo immagini per usare il brand di default.",
+        parse_mode="HTML"
+    )
+    logger.info(f"Start comando ricevuto da {update.effective_user.username}")
+
+async def set_brand(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /brand - imposta il brand personalizzato"""
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "📸 Ok! Adesso inviami l'immagine del brand/sfondo che vuoi usare.\n\n"
+        "Successivamente, quando invierai immagini normali, le incollerò su questo brand! 🎨"
+    )
+    # Imposta lo stato per il prossimo messaggio
+    context.user_data['waiting_for_brand'] = True
+    logger.info(f"Utente {user_id} in attesa di inviare il brand")
+
+async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestisce le immagini ricevute - semplice e affidabile"""
+    msg = update.message
+    user_id = update.effective_user.id
+    
+    logger.info(f"📥 MESSAGGIO RICEVUTO - Type: {type(msg)}, User: {user_id}")
+    logger.info(f"   Message content: photo={bool(msg.photo)}, text={msg.text if msg.text else 'No text'}")
+    
+    # Tenta di ottenere l'immagine
+    offer_bytes = None
+    
+    try:
+        # 1. Controlla se c'è una foto diretta
+        if msg.photo:
+            logger.info("✅ Foto diretta trovata")
+            photo = msg.photo[-1]
+            file = await photo.get_file()
+            offer_bytes = await file.download_as_bytearray()
+        
+        # 2. Se no, controlla se c'è un'immagine nel link preview
+        elif msg.link_preview_options and msg.link_preview_options.url:
+            url = msg.link_preview_options.url
+            logger.info(f"✅ Link preview trovato: {url}")
+            
+            # Download asincrono con httpx
+            try:
+                logger.info(f"🔄 Scaricando da httpx...")
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(url, follow_redirects=True)
+                logger.info(f"✅ Response status: {resp.status_code}, type: {type(resp.status_code)}")
+                if resp.status_code == 200:
+                    offer_bytes = resp.content
+                    logger.info(f"✅ Immagine scaricata: {len(offer_bytes)} bytes")
+                else:
+                    logger.error(f"❌ Status {resp.status_code}")
+            except Exception as e:
+                logger.error(f"❌ Errore download: {type(e).__name__}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"❌ Errore handler: {e}", exc_info=True)
+    
+    # 3. Se non c'è niente, rifiuta
+    logger.info(f"🔍 offer_bytes è None? {offer_bytes is None}, lunghezza: {len(offer_bytes) if offer_bytes else 0}")
+    if not offer_bytes:
+        logger.info(f"⚠️ Nessuna immagine trovata")
+        await msg.reply_text("📸 Inoltra un'immagine per favore! 😄")
+        return
+    
+    logger.info(f"✅ Ho l'immagine! Inizio elaborazione...")
+    try:
+        # Se l'utente sta impostando il brand
+        if context.user_data.get('waiting_for_brand'):
+            context.user_data['waiting_for_brand'] = False
+            
+            status = await msg.reply_text("⏳ Sto salvando il tuo brand...")
+            
+            # Carica brand in thread pool (non bloccare event loop)
+            loop = asyncio.get_event_loop()
+            brand_img = await loop.run_in_executor(thread_pool, lambda: Image.open(BytesIO(offer_bytes)))
+            
+            # Salvo il brand per questo utente
+            user_brands[user_id] = brand_img
+            
+            logger.info(f"Brand salvato per utente {user_id}: {brand_img.size[0]}x{brand_img.size[1]}")
+            
+            await msg.reply_photo(
+                photo=BytesIO(offer_bytes),
+                caption="✅ Brand salvato! Adesso inviami le immagini da incollare sopra questo brand 🎨"
+            )
+            await status.delete()
+            return
+        
+        # Altrimenti, sovrapponi l'immagine sul brand
+        status = await msg.reply_text("⏳ Sto elaborando la tua immagine...")
+        
+        # Carica immagine in thread pool
+        loop = asyncio.get_event_loop()
+        offer_img = await loop.run_in_executor(thread_pool, lambda: Image.open(BytesIO(offer_bytes)))
+        
+        logger.info(f"Immagine ricevuta: {offer_img.size[0]}x{offer_img.size[1]}")
+        
+        # Decido quale sfondo usare
+        if user_id in user_brands:
+            # Usa il brand personalizzato dell'utente
+            background = user_brands[user_id].copy()
+            logger.info(f"Usando brand personalizzato per utente {user_id}")
+        else:
+            # Usa lo sfondo di default
+            if not os.path.exists(BACKGROUND_PATH):
+                await msg.reply_text("❌ Sfondo di default non trovato!")
+                logger.error(f"Sfondo non trovato: {BACKGROUND_PATH}")
+                await status.delete()
+                return
+            
+            # Carica background in thread pool
+            background = await loop.run_in_executor(
+                thread_pool,
+                lambda: Image.open(BACKGROUND_PATH).convert("RGB")
+            )
+            logger.info("Usando sfondo di default")
+        
+        # Assicurati che il background sia in RGB
+        logger.info(f"🔍 Background mode: {background.mode}")
+        if background.mode != 'RGB':
+            logger.info("🔄 Convertendo background a RGB...")
+            background = background.convert('RGB')
+            logger.info("✅ Background convertito a RGB")
+        
+        logger.info(f"🔍 Background size: {background.size}")
+        bg_width, bg_height = background.size
+        
+        # Incolla l'immagine al centro con piccoli margini
+        margin = 30
+        
+        available_width = bg_width - (2 * margin)
+        available_height = bg_height - (2 * margin)
+        
+        logger.info(f"🔍 Available space: {available_width}x{available_height}")
+        
+        # Ridimensiona mantenendo proporzioni
+        offer_width, offer_height = offer_img.size
+        logger.info(f"🔍 Immagine originale: {offer_width}x{offer_height}")
+        ratio = min(available_width / offer_width, available_height / offer_height)
+        logger.info(f"🔍 Ratio: {ratio}")
+        
+        new_width = int(offer_width * ratio)
+        new_height = int(offer_height * ratio)
+        
+        logger.info(f"🔄 Ridimensionamento in thread pool: {new_width}x{new_height}...")
+        
+        # Funzione per elaborare immagine in thread pool
+        def process_image():
+            try:
+                thread_log("🎨 [process_image] Inizio ridimensionamento...")
+                # Ridimensiona
+                offer_img_resized = offer_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                thread_log(f"✅ [process_image] Ridimensionata a {new_width}x{new_height}")
+                
+                # Centra l'immagine
+                x_offset = margin + (available_width - new_width) // 2
+                y_offset = margin + (available_height - new_height) // 2
+                thread_log(f"✅ [process_image] Posizionata in ({x_offset}, {y_offset})")
+                
+                # Incolla l'immagine sullo sfondo
+                thread_log("🔄 [process_image] Copiando background...")
+                result = background.copy()
+                thread_log(f"✅ [process_image] Background copiato, mode: {result.mode}")
+                
+                if offer_img_resized.mode == 'RGBA':
+                    thread_log("🔄 [process_image] Pasting RGBA...")
+                    result.paste(offer_img_resized, (x_offset, y_offset), offer_img_resized)
+                else:
+                    thread_log("🔄 [process_image] Pasting RGB...")
+                    result.paste(offer_img_resized, (x_offset, y_offset))
+                thread_log("✅ [process_image] Immagine incollata")
+                
+                # Salva il risultato
+                thread_log("🔄 [process_image] Salvando PNG...")
+                output_buffer = BytesIO()
+                try:
+                    result.save(output_buffer, format='PNG')
+                    thread_log("✅ [process_image] PNG salvato!")
+                except Exception as e:
+                    thread_log(f"❌ [process_image] Errore PNG: {type(e).__name__}: {e}")
+                    # Fallback a JPEG
+                    result = result.convert('RGB')
+                    result.save(output_buffer, format='JPEG', quality=95)
+                    thread_log("✅ [process_image] JPEG fallback!")
+                output_buffer.seek(0)
+                thread_log(f"✅ [process_image] Buffer OK: {len(output_buffer.getvalue())} bytes")
+                return output_buffer
+            except Exception as e:
+                thread_log(f"❌ [process_image] CRASH: {type(e).__name__}: {str(e)[:200]}")
+                raise
+        
+        # Esegui in thread pool
+        logger.info("📤 Inviando process_image al thread pool...")
+        try:
+            output_buffer = await loop.run_in_executor(thread_pool, process_image)
+            logger.info(f"✅ Thread pool completato!")
+            logger.info(f"📥 Output buffer size: {len(output_buffer.getvalue())} bytes")
+        except Exception as e:
+            logger.error(f"❌ Thread pool ERRORE: {type(e).__name__}: {e}", exc_info=True)
+            await msg.reply_text("❌ Errore durante l'elaborazione dell'immagine. Riprova!")
+            await status.delete()
+            return
+        
+        logger.info(f"✅ Invio immagine brandizzata (buffer: {len(output_buffer.getvalue())} bytes)...")
+        
+        try:
+            # Invia direttamente i dati del buffer (non file)
+            logger.info("📸 Inviando immagine a Telegram...")
+            output_buffer.seek(0)
+            await msg.reply_photo(
+                photo=output_buffer,
+                caption="✨ Ecco la tua immagine brandizzata! 🎨"
+            )
+            logger.info("✅✅✅ FOTO INVIATA CON SUCCESSO! ✅✅✅")
+            
+        except Exception as e:
+            logger.error(f"❌❌❌ ERRORE REPLY_PHOTO: {type(e).__name__}: {str(e)[:500]}", exc_info=True)
+            try:
+                await msg.reply_text(f"❌ Errore nell'invio della foto a Telegram:\n{str(e)[:100]}")
+            except:
+                logger.error("Non riesco nemmeno a inviare il messaggio di errore!")
+        
+        # Elimina il messaggio di status (con protezione)
+        try:
+            await status.delete()
+            logger.info("🗑️ Messaggio di status eliminato")
+        except Exception as del_err:
+            logger.warning(f"⚠️ Non riesco a eliminare messaggio status: {del_err}")
+        
+        logger.info("✅ Immagine elaborata con successo")
+        
+    except Exception as e:
+        logger.error(f"❌ Errore handler: {type(e).__name__}: {str(e)[:300]}", exc_info=True)
+        try:
+            await msg.reply_text("❌ Errore nell'elaborazione dell'immagine. Riprova!")
+        except Exception as reply_err:
+            logger.error(f"❌ Errore invio messaggio di errore: {reply_err}")
+
+async def error_handler(update, context):
+    """Cattura TUTTI gli errori"""
+    logger.error(f"🚨 ERRORE GLOBALE: {context.error}", exc_info=context.error)
+
+def main():
+    """Avvia il bot con protezione globale"""
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    
+    if not token:
+        print("\n❌ ERRORE: TELEGRAM_BOT_TOKEN non configurato!")
+        print("Per configurare il token:")
+        print("1. Vai alla tab 'Secrets' in Replit")
+        print("2. Aggiungi TELEGRAM_BOT_TOKEN con il tuo token")
+        print("3. Ottieni il token da @BotFather su Telegram")
+        return
+    
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            logger.info(f"🚀 TENTATIVO #{attempt} - Avvio bot Telegram...")
+            
+            app = Application.builder().token(token).build()
+            
+            # Error handler GLOBALE per catturare tutti gli errori
+            app.add_error_handler(error_handler)
+            
+            # Comandi
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("brand", set_brand))
+            
+            # Handler universale per QUALSIASI messaggio (inclusi inoltrati con link preview)
+            app.add_handler(MessageHandler(filters.ALL, handler))
+            
+            logger.info("✅ Bot pronto! In attesa di immagini...")
+            
+            # Polling VELOCISSIMO - aggiorna ogni 0.1 secondi!
+            logger.info("📡 INIZIO POLLING VELOCE - Il bot riceverà i messaggi ISTANTANEAMENTE!")
+            app.run_polling(allowed_updates=Update.ALL_TYPES, timeout=5, poll_interval=0.1)
+            
+        except KeyboardInterrupt:
+            logger.info("⏹️ Bot interrotto")
+            break
+            
+        except Exception as e:
+            logger.error(f"❌ ERRORE POLLING (tentativo #{attempt}): {type(e).__name__}: {e}", exc_info=True)
+            logger.error("🔄 Riavvio bot tra 3 secondi...")
+            import time
+            time.sleep(3)
+            logger.info("---" * 20)
+
+if __name__ == '__main__':
+    main()
